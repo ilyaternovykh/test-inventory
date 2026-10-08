@@ -22,10 +22,14 @@ RUN pip install --upgrade pip \
 # Рабочая директория приложения
 WORKDIR /app
 
-# Скрипт-обёртка и парсер списка серверов
+# Скрипт-обёртка, парсер списка серверов и патч совместимости логина (3xx redirect)
 COPY entrypoint.sh /app/entrypoint.sh
 COPY servers_parser.py /app/servers_parser.py
+COPY cr_login_redirect_patch.py /app/cr_login_redirect_patch.py
 RUN chmod +x /app/entrypoint.sh
+
+# Каталог модулей PYTHONPATH для collect-а (патч подхватывается через -m)
+ENV PYTHONPATH=/app
 
 # Каталог для JSON-результатов (перекрывается volume inventory-data)
 RUN mkdir -p /app/inventory /app/status

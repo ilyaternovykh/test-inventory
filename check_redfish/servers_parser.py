@@ -53,18 +53,44 @@ DEFAULT_OUTPUT_DIR = "/app/inventory"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def find_check_redfish() -> str:
-    """Определяем путь к check_redfish.py внутри контейнера.
+def find_check_redfish() -> list:
+    """Определяем команду запуска check_redfish внутри контейнера.
 
-    Поддерживаем:
-      - env CR_SCRIPT / аргумент --cr-script (явный путь, для отладки);
-      - pip-installed раскладку (скрипт рядом с интерпретатором);
-      - git clone в типовые каталоги (/opt/check_redfish и т.п.);
-      - поискcheck_redfish(.py) в PATH.
-    Возвращает список argv-префикс запуска (может быть ["python3", ...]
-    или ["-m", "check_redfish"] — см. вызов в main).
+    Приоритет:
+      1. Патч-обёртка cr_login_redirect_patch (env CR_FIX_REDIRECT != "0"):
+         запускается как модуль `python -m cr_login_redirect_patch` — она
+         чинит падение «Unsafe redirect location» на BMC, отвечающих 3xx
+         редиректом на POST Sessions (XCC/Supermicro/часть iDRAC/iLO), и
+         затем передаёт управление штатному check_redfish.main().
+      2. env CR_SCRIPT / аргумент --cr-script (явный путь, для отладки).
+      3. pip-installed раскладка (скрипт рядом с интерпретатором).
+      4. git clone в типовые каталоги (/opt/check_redfish и т.п.).
+      5. check_redfish(.py) в PATH.
+      6. Модуль Python (-m check_redfish).
+    Возвращает argv-префикс запуска (список).
     """
     candidates = []
+
+    # 0) Патч-модуль совместимости 3xx-редиректа (по умолчанию включён)
+    if os.environ.get("CR_FIX_REDIRECT", "1") != "0":
+        try:
+            import importlib.util
+            if importlib.util.find_spec("cr_login_redirect_patch") is not None:
+                return [sys.executable, "-m", "cr_login_redirect_patch"]
+        except (ImportError, ValueError, ModuleNotFoundError):
+            pass
+        # fallback: файл рядом с этим скриптом (если PYTHONPATH=/app не задан)
+        local_mod = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "cr_login_redirect_patch.py")
+        if os.path.exists(local_mod):
+            return [sys.executable, local_mod]
+
+    # 1) Вариант "pip install git+https://..." — скрипт рядом с интерпретатором
+    bin_dir = os.path.dirname(sys.executable)
+    for name in ("check_redfish.py", "check_redfish"):
+        path = os.path.join(bin_dir, name)
+        if os.path.exists(path):
+            candidates.append([sys.executable, path])
 
     # 0) Явное указание (env/CLI) — имеет приоритет
     # (обрабатывается в main через args.cr_script)
