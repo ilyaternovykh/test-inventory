@@ -1,0 +1,48 @@
+# =============================================================================
+# Конфигурация netbox-sync (https://github.com/bb-Ricardo/netbox-sync)
+# Файл монтируется в контейнер как /app/settings.yaml (только чтение).
+#
+# ВАЖНО: значения host_fqdn и api_token здесь — заглушки. Реальные значения
+# передаются через переменные окружения NBS_NETBOX_HOST_FQDN и
+# NBS_NETBOX_API_TOKEN (см. .env) — по механизму overrides netbox-sync они
+# перекрывают то, что записано в этом файле. Так секреты не попадают в git.
+# =============================================================================
+
+common:
+  # Уровень логирования. Для ПЕРВОГО запуска рекомендуется DEBUG2
+  # (можно временно переопределить без правки файла:
+  #   NBS_COMMON_LOG_LEVEL=DEBUG2 docker compose up)
+  log_level: INFO
+  # Отладочный режим: true — ничего не меняется в NetBox, изменения только логируются
+  dry_run: false
+
+netbox:
+  # Заглушки! Реальные значения приходят из env: NBS_NETBOX_HOST_FQDN,
+  # NBS_NETBOX_API_TOKEN. Не храните токен в этом файле.
+  host_fqdn: netbox.example.com
+  api_token: "REPLACE_VIA_ENV_NBS_NETBOX_API_TOKEN"
+  # Схема/порт обращений к API (NetBox обычно за HTTPS)
+  use_tls: true
+  tls_verify: true
+  # Удаление объектов из NetBox, которых больше нет в источнике (Redfish)
+  prune_enabled: true
+  # Интервал выполнения prune, дней
+  prune_interval: 7
+  # Разделитель имён при генерации slug/имён объектов
+  default_name_separator: " / "
+
+source:
+  # Имя источника — любое; тип check_redfish читает JSON-отчёты коллектора
+  redfish-servers:
+    type: check_redfish
+    enabled: true
+    # Каталог с файлами <server>.json (общий volume с check_redfish-collector)
+    inventory_file_path: /app/inventory/
+    # КЛЮЧЕВАЯ настройка: аппаратные компоненты (CPU, DIMM, NIC, PSU, диски)
+    # создаются как Module Bay + Module + Module Type, а НЕ как Inventory Items
+    model_components_as_modules: true
+    # Интервал перечитывания источника, секунд (меньше цикла коллектора —
+    # просто ждём свежие файлы; реальный темп задаёт entrypoint SYNC_INTERVAL)
+    update_interval: 900
+    # Опционально: сопоставление имени источника с site/role NetBox можно
+    # дописать здесь же, если потребуется (см. документацию netbox-sync)
