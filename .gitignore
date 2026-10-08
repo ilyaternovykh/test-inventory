@@ -1,11 +1,4 @@
-# Секреты — никогда не коммитим!
+# Environment
 .env
-check_redfish/servers.yaml
-
-# Артефакты Python
-__pycache__/
-*.pyc
-
-# Локальные артефакты docker/volumes (на случай bind-mount отладки)
-inventory/
-cache/
+.env.local
+*.env.*

@@ -278,6 +278,42 @@ docker compose exec check_redfish-collector \
 
 Сервер с ошибкой пропускается, остальные обрабатываются штатно; цикл не падает.
 
+### 1a. BMC отвечает редиректом: «Unsafe redirect location» / «max retries exhausted» / curl даёт `HTTP/1.1 308 Moved Permanently`
+
+Это поведение Lenovo XCC (и части прошивок iDRAC/iLO): BMC отвечает **3xx-редиректом**
+(часто 308 Permanent Redirect) на Redfish-URL, причём заголовок `Location` указывает
+на **тот же самый путь** (само-редирект). Stock check_redfish такие ответы не понимает:
+валидатор редиректа падает с `Unsafe redirect location`, а redfish-клиент — с
+`max retries exhausted` (rc=2).
+
+В коллекторе встроен патч `cr_login_redirect_patch.py` (включён по умолчанию), который:
+- резолвит относительный `Location` и повторяет POST Sessions на целевой URL;
+- при само-редиректе повторяет запрос ещё раз (XCC после «прогревающей» попытки обычно
+  отдаёт `201 Created` + заголовок `X-Auth-Token`);
+- для GET-запросов вручную проходит цепочку 3xx-редиректов (лимит — env `CR_MAX_REDIRECTS`,
+  по умолчанию 5) вместо падения requests;
+- если токен так и не получен — автоматически переключается на Basic-auth fallback;
+- печатает реальные коды ответов и `Location` в stderr (видно в `docker logs`).
+
+Диагностика вашего BMC из контейнера (покажет, что именно отвечает firmware):
+
+```bash
+# 1) Включить preflight-диагностику collectors-а (печатает GET root и POST Sessions с Location):
+docker compose exec check_redfish-collector sh -c \
+  'CR_PREFLIGHT=1 python3 -m cr_login_redirect_patch -H <BMC_IP>:443 -u <user> -p "<pass>" --all --inventory --inventory_file /tmp/t.json --nosession'
+
+# 2) Ручной curl-эквивалент (обратите внимание на < location: и код второй попытки):
+docker compose exec check_redfish-collector curl -sk -i -X POST \
+  https://<BMC_IP>/redfish/v1/SessionService/Sessions \
+  -d '{"UserName":"admin","Password":"..."}' --max-redirs 3 -w '\n--- retry ---\n' \
+  -H 'Content-Type: application/json'
+```
+
+Если после обновления образа ошибка осталась — проверьте, что образ пересобран
+(`docker compose build check_redfish-collector && docker compose up -d`), и временно
+увеличьте ретраи/таймауты в `.env`: `CR_CONN_RETRIES=8`, `CR_REQ_TIMEOUT=60`.
+Отключить патч целиком: `CR_FIX_REDIRECT=0` (не рекомендуется для XCC).
+
 ### 2. Устройство не найдено в NetBox / создаётся дубль
 
 - netbox-sync ищет устройство по **serial**. Убедитесь, что у существующего

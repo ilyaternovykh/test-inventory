@@ -29,6 +29,20 @@ services:
       CHECK_INTERVAL: ${CHECK_INTERVAL:-14400}
       # Задержка перед первым прогоном после старта контейнера, секунд
       STARTUP_DELAY: ${STARTUP_DELAY:-60}
+      # --- Тонкая настройка check_redfish (обычно можно не менять) -----------
+      # Патч 3xx-редиректа логина: 1 (вкл, по умолчанию) / 0 (откл = stock)
+      CR_FIX_REDIRECT: ${CR_FIX_REDIRECT:-1}
+      # Число ретраев соединения redfish-клиента (-r): BMC часто обрывают
+      # keep-alive, увеличенные ретраи лечат 'max retries exhausted'
+      CR_CONN_RETRIES: ${CR_CONN_RETRIES:-5}
+      # Таймаут одного HTTP-запроса к BMC, секунд (-t)
+      CR_REQ_TIMEOUT: ${CR_REQ_TIMEOUT:-30}
+      # Preflight-диагностика BMC перед сбором (1 = вкл; печатает реальные
+      # ответы POST/GET Sessions — полезно при разборе ошибок подключения)
+      CR_PREFLIGHT: ${CR_PREFLIGHT:-0}
+      # Максимум шагов обхода 3xx-редиректов для GET-запросов к BMC
+      # (патч автообхода; актуально для Lenovo XCC с '308 Moved Permanently')
+      CR_MAX_REDIRECTS: ${CR_MAX_REDIRECTS:-5}
     volumes:
       # Общий том с JSON-файлами инвентаря (отдаётся netbox-sync)
       - inventory-data:/app/inventory

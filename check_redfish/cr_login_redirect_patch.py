@@ -18,6 +18,20 @@ Location hostname == None => проверка падает => исключени
 Location относительно исходного sessions_url (urljoin), и при совпадении пути разрешаем редирект.
 Модуль патчит только сам себя (импортируется из site-packages), файлы пакета не меняются.
 
+Дополнительно (наблюдаемый симптом 2): BMC Lenovo XCC отвечает на POST Sessions редиректом
+308 Permanent Redirect с Location == тот же самый URL. При ручном curl без --max-redirs это
+выглядит как «зацикливание», а requests внутри redfish-клиента выбрасывает
+RetriesExhaustedError («max retries exhausted»). Поэтому патч:
+  * перехватывает ВСЕ HTTP-запросы через requests.sessions.Session.request и для GET/HEAD
+    автоматически проходит цепочку 3xx-редиректов вручную (до CR_MAX_REDIRECTS шагов,
+    по умолчанию 5) — вместо падения requests TooManyRedirects;
+  * в логине повторяет POST на Location (307/308 сохраняют метод и тело); если целевой URL
+    совпадает с исходным (само-редирект), запрос повторяется ещё раз (BMC после первой
+    «прогревающей» попытки обычно отдаёт 201 + X-Auth-Token); если токена так и нет —
+    срабатывает Basic-auth fallback;
+  * печатает реальные коды ответов и Location в stderr — чтобы по docker logs было видно,
+    что именно отвечает BMC (в т.ч. заголовок Location у 308).
+
 Подключение: python -m cr_login_redirect_patch <аргументы check_redfish>
 (см. entrypoint.sh / servers_parser.py — включается env CR_FIX_REDIRECT=1, по умолчанию включён).
 """
@@ -27,6 +41,125 @@ import sys
 from urllib.parse import urljoin, urlparse
 
 
+def _max_redirects():
+    """Максимум шагов редиректа для ручного обхода 3xx-цепочек (env CR_MAX_REDIRECTS)."""
+    try:
+        return max(1, int(os.environ.get("CR_MAX_REDIRECTS", "5")))
+    except ValueError:
+        return 5
+
+
+def _is_transient_conn_error(exc):
+    """True, если исключение — сетевая ошибка (retry-able), а не ошибка BMC/аутентификации."""
+    try:
+        import requests
+    except ImportError:
+        return False
+    return isinstance(exc, (requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout))
+
+
+# --- Хелперы доступа к классам ошибок redfish-библиотеки --------------------- #
+# Используется ленивый импорт: на хосте для тестов эти классы могут отсутствовать.
+def _rf_err(name, fallback_base=Exception):
+    """Возвращает класс ошибки из redfish.rest.v1 (или динамический fallback)."""
+    try:
+        import redfish.rest.v1 as rv1
+        return getattr(rv1, name)
+    except Exception:
+        if fallback_base is None:
+            raise
+        return type(name, (fallback_base,), {})
+
+
+def redfish_invalid_credentials_error():
+    return _rf_err("InvalidCredentialsError")
+
+
+def redfish_rest_retries_exhausted(msg):
+    """Экземпляр RetriesExhaustedError (check_redfish мапит его в понятный CRITICAL)."""
+    return _rf_err("RetriesExhaustedError")(msg)
+
+
+def redfish_server_down_or_unreachable(msg):
+    """Экземпляр ServerDownOrUnreachableError с ПОНЯТНЫМ текстом.
+
+    ВАЖНО: stock check_redfish ловит это исключение в init_connection() и печатает
+    generic 'Host ... down or unreachable.' без текста причины. Поэтому текст
+    дублируется здесь, в stderr — чтобы в 'docker logs' было видно реальную причину.
+    """
+    exc = _rf_err("ServerDownOrUnreachableError")(msg)
+    print(f"[cr_login_redirect_patch] {msg}", file=sys.stderr)
+    return exc
+
+
+def _follow_get_redirects(session, method, url, kwargs):
+    """Ручной обход цепочки 3xx-редиректов для GET/HEAD (requests их не проходит сам,
+    когда allow_redirects=False, а с allow_redirects=True зацикливается на само-редиректах).
+
+    session — объект requests.Session; оригинальный Session.request вызывается через
+    __class__ (он может быть уже запатчен этим же кодом — рекурсии нет, т.к. request_fn
+    это saved-ссылка на НЕпатченый метод). Возвращает последний Response.
+    Логирует каждый шаг в stderr (видно в docker logs без DEBUG).
+    """
+    max_steps = _max_redirects()
+    request_fn = getattr(session.__class__, "_cr_orig_request", None)
+    if request_fn is None:  # патч ещё не применён — используем текущий метод как есть
+        request_fn = session.request
+    resp = None
+    cur = url
+    for step in range(max_steps + 1):
+        kw = dict(kwargs)
+        kw["allow_redirects"] = False
+        resp = request_fn(session, method, cur, **kw)
+        if resp.status_code not in (301, 302, 303, 307, 308):
+            return resp
+        loc = resp.headers.get("Location") or resp.headers.get("location")
+        if not loc:
+            return resp
+        nxt = urljoin(cur, loc)
+        print(f"[cr_login_redirect_patch] {method} {cur} -> HTTP {resp.status_code}, "
+              f"Location: {loc}; шаг {step + 1}/{max_steps}", file=sys.stderr)
+        if nxt == cur:
+            # само-редирект: повтор ещё не имеет смысла — возвращаем как есть
+            print("[cr_login_redirect_patch] Редирект указывает на тот же URL "
+                  "(само-редирект BMC) — прекращаем обход.", file=sys.stderr)
+            return resp
+        # 303 к GET; 307/308 сохраняют метод (для GET это тоже GET)
+        cur = nxt
+    print(f"[cr_login_redirect_patch] Превышен лимит редиректов ({max_steps}) для {url}",
+          file=sys.stderr)
+    return resp
+
+
+def _patch_requests_session():
+    """Патчит requests.sessions.Session.request: включает автоматический обход 3xx
+    для всех запросов collector-а (Redfish root, Services, Systems и т.д.), которые
+    stock check_redfish отправляет с allow_redirects=False. Идемпотентно."""
+    import requests
+    from requests.sessions import Session
+
+    if getattr(Session, "_cr_auto_redirect_patched", False):
+        return
+    orig_request = Session.request
+    # сохраняем ссылку на оригинал — по ней обход редиректов вызывает реальные запросы
+    Session._cr_orig_request = orig_request
+
+    def patched_request(self, method, url, **kwargs):
+        ar = kwargs.get("allow_redirects", True)
+        m = str(method).upper()
+        if ar is False and m in ("GET", "HEAD"):
+            # GET/HEAD с отключёнными редиректами на BMC с 308 зависают/падают —
+            # проходим цепочку вручную (с логом каждого шага)
+            return _follow_get_redirects(self, method, url, kwargs)
+        return orig_request(self, method, url, **kwargs)
+
+    Session.request = patched_request
+    Session._cr_auto_redirect_patched = True
+    print("[cr_login_redirect_patch] Автообход 3xx-редиректов для GET-запросов включён "
+          f"(лимит: {_max_redirects()}, env CR_MAX_REDIRECTS).", file=sys.stderr)
+
+
 def apply_patch():
     """Возвращает True, если патчинг применён успешно."""
     try:
@@ -34,6 +167,13 @@ def apply_patch():
         from cr_module.classes import redfish as rf_mod
     except ImportError:
         return False
+
+    # автообход редиректов на уровне requests (не зависит от cr_module)
+    try:
+        _patch_requests_session()
+    except Exception as e:
+        print(f"[cr_login_redirect_patch] WARNING: патч requests.Session не применён: {e}",
+              file=sys.stderr)
 
     RedfishConnection = rf_mod.RedfishConnection
     # если патч уже применялся ранее — выходим
@@ -68,44 +208,124 @@ def apply_patch():
         sessions_url = f"{base_url}/redfish/v1/SessionService/Sessions"
         login_payload = {"UserName": self.username, "Password": self.password}
 
-        # общий кодированный запрос (SSL verify=False — как в оригинале)
-        def post(url):
-            return requests.post(
-                url, json=login_payload,
-                timeout=self.cli_args.timeout,
-                verify=False, allow_redirects=False,
-            )
+        # Запасной вариант: stock-логин redfish-библиотеки (Basic-auth fallback).
+        # Некоторые BMC (отдельные прошивки XCC/Supermicro/iDRAC) не отдают
+        # X-Auth-Token на POST Sessions в обход redfish-клиента (например,
+        # сессионная политика требует заголовков Redfish-Version/OData-Version,
+        # которые подставляет только сам redfish-клиент). В этом случае штатный
+        # connection.login() работает корректно — используем его как fallback.
+        def basic_fallback():
+            try:
+                self.connection.login(
+                    username=self.username, password=self.password,
+                    session_enabled=False,
+                )
+                print("[cr_login_redirect_patch] Логин выполнен через Basic-auth "
+                      "fallback (redfish-клиент библиотеки).", file=sys.stderr)
+                return True
+            except Exception as fe:
+                if _is_transient_conn_error(fe):
+                    raise  # сетевая проблема — отдаём наверх как ретраабельную
+                print(f"[cr_login_redirect_patch] Basic-auth fallback не удался: {fe}",
+                      file=sys.stderr)
+                return False
 
-        response = post(sessions_url)
+        # Общий кодированный запрос (SSL verify=False — как в оригинале).
+        # Транзиентные сетевые ошибки (BMC временами рвёт keep-alive соединения)
+        # повторяются несколько раз с паузой — это лечит «max retries exhausted».
+        retry_max = int(os.environ.get("CR_LOGIN_RETRIES", "3"))
+        retry_wait = float(os.environ.get("CR_LOGIN_RETRY_WAIT", "2"))
+        last_exc = None
 
-        if response.status_code in (301, 302, 303, 307, 308):
-            redirect_url = response.headers.get("Location") or response.headers.get("location")
-            if not redirect_url:
-                raise Exception("Redirect response missing Location header")
-            # резолвим относительный Location против исходного URL сессий
-            redirect_abs = urljoin(sessions_url, redirect_url)
-            if not _patched_is_safe(redirect_abs, self.cli_args.host):
-                raise Exception(f"Unsafe redirect location: {redirect_url}")
-            response = post(redirect_abs)
+        for attempt in range(1, retry_max + 1):
+            try:
+                resp1 = requests.post(
+                    sessions_url, json=login_payload,
+                    timeout=self.cli_args.timeout,
+                    verify=False, allow_redirects=False,
+                )
+                print(f"[cr_login_redirect_patch] POST {sessions_url} -> HTTP "
+                      f"{resp1.status_code}"
+                      + (f", Location: {resp1.headers.get('Location')}"
+                         if resp1.headers.get("Location") else ""), file=sys.stderr)
+                response = resp1
+                if resp1.status_code in (301, 302, 303, 307, 308):
+                    redirect_url = resp1.headers.get("Location") or resp1.headers.get("location")
+                    if not redirect_url:
+                        raise Exception("Redirect response missing Location header")
+                    # резолвим относительный Location против исходного URL сессий
+                    redirect_abs = urljoin(sessions_url, redirect_url)
+                    if not _patched_is_safe(redirect_abs, self.cli_args.host):
+                        raise Exception(f"Unsafe redirect location: {redirect_url}")
+                    response = requests.post(
+                        redirect_abs, json=login_payload,
+                        timeout=self.cli_args.timeout,
+                        verify=False, allow_redirects=False,
+                    )
+                    print(f"[cr_login_redirect_patch] POST (redirect) {redirect_abs} -> HTTP "
+                          f"{response.status_code}", file=sys.stderr)
 
-        session_token = response.headers.get("X-Auth-Token")
-        session_location = response.headers.get("Location")
+                    # Само-редирект (характерно для Lenovo XCC: 308 -> тот же URL):
+                    # BMC часто отдаёт 201 + X-Auth-Token со второй попытки.
+                    if (response.status_code in (301, 302, 303, 307, 308)
+                            and urljoin(redirect_abs,
+                                        response.headers.get("Location") or "") == redirect_abs):
+                        response = requests.post(
+                            redirect_abs, json=login_payload,
+                            timeout=self.cli_args.timeout,
+                            verify=False, allow_redirects=False,
+                        )
+                        print(f"[cr_login_redirect_patch] POST (повтор после само-редиректа) "
+                              f"{redirect_abs} -> HTTP {response.status_code}", file=sys.stderr)
 
-        if session_token is not None:
-            self.connection.set_session_key(session_token)
-            if session_location is not None:
-                self.connection.set_session_location(session_location)
-            return
+                session_token = response.headers.get("X-Auth-Token")
+                session_location = response.headers.get("Location")
 
-        if response.status_code == 201:
-            raise Exception("Login succeeded but no session token received")
-        elif response.status_code == 401:
-            import redfish
-            raise redfish.rest.v1.InvalidCredentialsError("Authentication failed")
-        elif response.status_code >= 500:
-            raise Exception(f"Server error during login: {response.status_code}")
-        else:
-            raise Exception(f"Login failed with status {response.status_code}: {response.text}")
+                if session_token is not None:
+                    self.connection.set_session_key(session_token)
+                    if session_location is not None:
+                        self.connection.set_session_location(session_location)
+                    return
+
+                # BMC принял редирект/POST, но токена нет — пробуем Basic-auth fallback
+                # (401 здесь означает реальные неверные креды — fallback не поможет)
+                if response.status_code != 401 and basic_fallback():
+                    return
+
+                if response.status_code == 201:
+                    raise Exception("Login succeeded but no session token received")
+                elif response.status_code == 401:
+                    import redfish
+                    raise redfish.rest.v1.InvalidCredentialsError("Authentication failed")
+                elif response.status_code >= 500:
+                    raise Exception(f"Server error during login: HTTP {response.status_code}")
+                else:
+                    body = (response.text or "")[:200]
+                    raise Exception(
+                        f"Login failed with status {response.status_code}: {body} "
+                        f"(проверьте учётные данные и что Redfish включён на BMC; "
+                        f"диагностика: CR_PREFLIGHT=1)"
+                    )
+
+            except requests.exceptions.Timeout:
+                raise redfish_rest_retries_exhausted("Request timeout")
+            except requests.exceptions.SSLError:
+                raise redfish_server_down_or_unreachable("SSL connection failed")
+            except requests.exceptions.ConnectionError as e:
+                # Соединение разорвано/refused — для некоторых BMC это транзиентно:
+                # повторяем попытку вместо мгновенного падения.
+                last_exc = e
+                if attempt < retry_max:
+                    print(f"[cr_login_redirect_patch] Попытка {attempt}/{retry_max}: "
+                          f"соединение прервано ({type(e).__name__}), повтор через "
+                          f"{retry_wait}s...", file=sys.stderr)
+                    import time as _t
+                    _t.sleep(retry_wait)
+                    continue
+                raise redfish_server_down_or_unreachable(
+                    f"Connection failed after {retry_max} attempts: {e}")
+            except redfish_invalid_credentials_error() as e:
+                raise  # неверные креды — не ретраим, чтобы не блокировать учётку на BMC
 
     RedfishConnection.login_with_redirect_handling = _patched_login
     RedfishConnection._cr_redirect_patched = True
@@ -217,6 +437,54 @@ def _extract_opt(argv, flag):
         return None
 
 
+def _network_diagnosis(host, port_hint=None):
+    """Диагностика сети до BMC при ConnectionError: TCP-порт + ICMP-подобная проверка.
+
+    Печатает в stderr конкретные гипотезы (маршрут / firewall / docker-сеть), чтобы по
+    'docker logs' можно было отличить недоступный BMC от проблем с учётками/BMC-API.
+    Возвращает строку-резюме (может быть пустой).
+    """
+    import socket
+    hp = str(host or "").strip()
+    if "://" in hp:
+        hp = hp.split("://", 1)[1]
+    hostname = hp.rsplit("/", 1)[0]
+    if ":" in hostname:
+        hname, _, pstr = hostname.rpartition(":")
+        port = int(pstr) if pstr.isdigit() else 443
+        hostname = hname
+    else:
+        port = int(port_hint) if port_hint else 443
+
+    lines = []
+    # 1) Разрешение имени (для IP пропускаем)
+    try:
+        infos = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
+        ip = infos[0][4][0]
+        lines.append(f"DNS: {hostname} -> {ip}")
+    except socket.gaierror as e:
+        lines.append(f"DNS: НЕ резолвится '{hostname}': {e}. "
+                     "Проверьте host в servers.yaml / DNS контейнера.")
+        return "\n".join(lines)
+
+    # 2) TCP connect с таймаутом
+    try:
+        s = socket.create_connection((hostname, port), timeout=8)
+        s.close()
+        lines.append(f"TCP: порт {port} на {hostname} ОТКРЫТ — проблема не в сети; "
+                     "см. текст ошибки логина выше (учётки / Redfish выключен на BMC). "
+                     "Включите диагностику: CR_PREFLIGHT=1")
+    except OSError as e:
+        errno_ = getattr(e, "errno", None)
+        hint = {
+            111: "Connection refused — на BMC нет HTTPS на этом порту (проверьте port в servers.yaml)",
+            113: "No route to host — контейнер не видит подсеть BMC (redfish-network/маршруты)",
+            101: "Network unreachable — docker-сеть не маршрутизируется к BMC",
+        }.get(errno_, "")
+        lines.append(f"TCP: connect {hostname}:{port} не удался: {type(e).__name__} ({e}). {hint}".rstrip())
+    return "\n".join(lines)
+
+
 def main():
     """Запуск check_redfish.main() с активным патчем (модуль вызывается как
     `python -m cr_login_redirect_patch ...`). Аргументы передаются как есть."""
@@ -240,7 +508,27 @@ def main():
                 print(out, file=sys.stderr)
 
     from check_redfish import main as cr_main
-    cr_main()
+    try:
+        cr_main()
+    except SystemExit:
+        raise
+    except BaseException as e:
+        # Stock check_redfish при сетевых сбоях печатает только generic
+        # 'max retries exhausted' без причины. Добавляем диагностику сети,
+        # чтобы в docker logs было видно реальный корень проблемы.
+        text = f"{type(e).__name__}: {e}"
+        lowered = text.lower()
+        if ("unreachable" in lowered or "retries exhausted" in lowered
+                or "unable to connect" in lowered):
+            try:
+                argv = sys.argv[1:]
+                host = _extract_opt(argv, "-H") or _extract_opt(argv, "--host")
+                if host:
+                    print("[cr_login_redirect_patch] Диагностика соединения:", file=sys.stderr)
+                    print(_network_diagnosis(host), file=sys.stderr)
+            except Exception:
+                pass
+        raise
 
 
 if __name__ == "__main__":
