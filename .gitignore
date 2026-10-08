@@ -1,1 +1,11 @@
-(empty)
+# Секреты — никогда не коммитим!
+.env
+check_redfish/servers.yaml
+
+# Артефакты Python
+__pycache__/
+*.pyc
+
+# Локальные артефакты docker/volumes (на случай bind-mount отладки)
+inventory/
+cache/
