@@ -1,0 +1,42 @@
+# =============================================================================
+# Список серверов для инвентаризации через Redfish.
+# Скопируйте в check_redfish/servers.yaml и заполните своими данными:
+#     cp check_redfish/servers.yaml.example check_redfish/servers.yaml
+#
+# Поля каждого сервера:
+#   name             — обязательное, уникальное имя (по нему создаётся
+#                      /app/inventory/<name>.json и устройство в NetBox);
+#                      допустимы буквы, цифры, «.» , «_» , «-».
+#   host             — обязательное, FQDN или IP контроллера BMC
+#                      (iLO / iDRAC / XCC).
+#   port             — необязательное, порт Redfish API (по умолчанию 443).
+#   username         — необязательное, переопределяет общий REDFISH_USERNAME.
+#   password         — необязательное, переопределяет общий REDFISH_PASSWORD.
+#   netbox_device_id — необязательное, числовой id устройства в NetBox.
+#                      Если задан — netbox-sync сматчит устройство строго по
+#                      нему (meta.inventory_id). Если не задан — матчинг идёт
+#                      по серийному номеру (или Dell Service Tag).
+#
+# ВНИМАНИЕ: если храните пароли здесь — файл servers.yaml содержит секреты!
+# Предпочтительнее общие credentials из .env, а в servers.yaml держать только
+# исключения. Файл servers.yaml добавлен в .gitignore.
+# =============================================================================
+
+servers:
+  # Пример 1: HPE ProLiant с iLO, используются общие креды из .env
+  - name: server01
+    host: server01-ilo.example.com
+    # port: 443            # опционально (по умолчанию 443)
+    # netbox_device_id: 12 # опционально: id устройства в NetBox
+
+  # Пример 2: Dell PowerEdge с iDRAC, отдельные учётные данные
+  - name: server02
+    host: server02-idrac.example.com
+    # username: admin
+    # password: secret
+
+  # Пример 3: Lenovo System x с XCC, отдельный id устройства в NetBox
+  - name: server03
+    host: 10.0.5.33
+    port: 443
+    netbox_device_id: 47

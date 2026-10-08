@@ -1,0 +1,106 @@
+# =============================================================================
+# MVP: автоматическая инвентаризация серверов через Redfish -> NetBox
+#
+# Пайплайн:
+#   check_redfish (сбор inventory в JSON) -> shared volume -> netbox-sync -> NetBox API
+#
+# Все настройки вынесены в .env (см. .env.example). Файл .env НЕ коммитить в git!
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Collector: опрашивает Redfish API (iLO / iDRAC / XCC) всех серверов из
+  # servers.yaml и складывает результаты в общий volume inventory-data.
+  # ---------------------------------------------------------------------------
+  check_redfish-collector:
+    build:
+      context: ./check_redfish           # Dockerfile собирает python:3.9-slim + check_redfish
+      dockerfile: Dockerfile
+    image: local/check_redfish-mvp:latest
+    container_name: check_redfish-collector
+    restart: unless-stopped
+    environment:
+      # Общие учётные данные Redfish (можно переопределить для каждого сервера
+      # прямо в servers.yaml полями username/password)
+      REDFISH_USERNAME: ${REDFISH_USERNAME:?Укажите REDFISH_USERNAME в файле .env}
+      REDFISH_PASSWORD: ${REDFISH_PASSWORD:?Укажите REDFISH_PASSWORD в файле .env}
+      # Интервал полного прохода по всем серверам, секунд (по умолчанию 4 часа)
+      CHECK_INTERVAL: ${CHECK_INTERVAL:-14400}
+      # Задержка перед первым прогоном после старта контейнера, секунд
+      STARTUP_DELAY: ${STARTUP_DELAY:-60}
+    volumes:
+      # Общий том с JSON-файлами инвентаря (отдаётся netbox-sync)
+      - inventory-data:/app/inventory
+      # Список серверов (только чтение)
+      - ./check_redfish/servers.yaml:/app/servers.yaml:ro
+      # Маркер heartbeat для healthcheck (записывается в конце каждого цикла)
+      - collector-status:/app/status
+    healthcheck:
+      # Сервис считается живым, если heartbeat-файл /app/status/last_run
+      # обновлялся за последние CHECK_HOURS часов (по умолчанию 8 = 2 цикла).
+      # entrypoint.sh трогает этот файл в конце каждого полного прохода.
+      test: ["CMD-SHELL", "find /app/status/last_run -mmin -$(( ${CHECK_INTERVAL:-14400} / 60 * 2 )) | grep -q last_run"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 20m
+    networks:
+      - redfish-network                 # доступ к BMC (iLO/iDRAC/XCC) серверов
+
+  # ---------------------------------------------------------------------------
+  # Sync: читает JSON из inventory-data и синхронизирует объекты в NetBox
+  # (Device -> Module Bays -> Modules -> Module Types) через REST API.
+  # ---------------------------------------------------------------------------
+  netbox-sync:
+    image: ghcr.io/bb-ricardo/netbox-sync:latest
+    container_name: netbox-sync
+    restart: unless-stopped
+    depends_on:                          # стартуем только после коллектора
+      check_redfish-collector:
+        condition: service_started
+    entrypoint: ["/bin/sh", "/app/entrypoint.sh"]   # собственный обёрточный скрипт
+    command: ["python", "-u", "/app/netbox_sync.py", "-c", "/app/settings.yaml"]
+    environment:
+      # Адрес NetBox берём из .env (в settings.yaml он подставляется при старте)
+      NBS_NETBOX_HOST_FQDN: ${NBS_NETBOX_HOST_FQDN:?Укажите NBS_NETBOX_HOST_FQDN в файле .env}
+      NBS_NETBOX_API_TOKEN: ${NBS_NETBOX_API_TOKEN:?Укажите NBS_NETBOX_API_TOKEN в файле .env}
+      NBS_COMMON_LOG_LEVEL: ${NBS_COMMON_LOG_LEVEL:-INFO}
+      # Интервал между циклами синхронизации, секунд (по умолчанию 15 минут)
+      SYNC_INTERVAL: ${SYNC_INTERVAL:-900}
+      # Задержка перед первой синхронизацией, секунд (ждём первый сбор коллектора)
+      STARTUP_DELAY: ${STARTUP_DELAY:-60}
+    volumes:
+      - inventory-data:/app/inventory:ro   # читаем JSON, собранные коллектором
+      - netbox-sync-cache:/app/cache       # кэш соответствий (id/hashes) между запусками
+      - ./netbox-sync/settings.yaml:/app/settings.yaml:ro
+      - ./netbox-sync/entrypoint.sh:/app/entrypoint.sh:ro
+      - sync-status:/app/status            # маркер heartbeat для healthcheck
+    healthcheck:
+      # Сервис считается живым, если heartbeat-файл /app/status/last_run
+      # обновлялся за последние 3 цикла синхронизации.
+      test: ["CMD-SHELL", "find /app/status/last_run -mmin -$(( ${SYNC_INTERVAL:-900} / 60 * 3 )) | grep -q last_run"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 20m
+    networks:
+      - netbox-network                  # доступ к REST API NetBox
+
+# -----------------------------------------------------------------------------
+# Общие тома: коллектор пишет -> netbox-sync читает
+# -----------------------------------------------------------------------------
+volumes:
+  inventory-data:      # JSON-файлы инвентаря (/app/inventory/<server>.json)
+  netbox-sync-cache:   # служебный кэш netbox-sync
+  collector-status:    # heartbeat коллектора для healthcheck
+  sync-status:         # heartbeat netbox-sync для healthcheck
+
+# -----------------------------------------------------------------------------
+# Сети: redfish-network — к BMC, netbox-network — к NetBox (могут быть разные VLAN)
+# -----------------------------------------------------------------------------
+networks:
+  redfish-network:
+    driver: bridge
+  netbox-network:
+    driver: bridge
