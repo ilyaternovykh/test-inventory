@@ -158,11 +158,15 @@ def load_servers(config_path: str) -> list:
 
 
 def build_command(cr_prefix: list, server: dict, output_dir: str,
-                  default_user: str, default_pass: str) -> tuple:
+                  default_user: str, default_pass: str,
+                  cr_retries: int = 5, cr_timeout: int = 30) -> tuple:
     """Собирает argv для одного сервера.
 
     Возвращает (cmd_list, inventory_json_path) или (None, причина_ошибки).
     Поля username/password сервера переопределяют общие REDFISH_* env.
+    cr_retries/cr_timeout — параметры соединения check_redfish (-r/-t):
+    увеличенные ретраи лечат 'max retries exhausted' на BMC, которые
+    периодически обрывают keep-alive соединения.
     """
     name = str(server.get("name", "")).strip()
     host = str(server.get("host", "")).strip()
@@ -192,6 +196,12 @@ def build_command(cr_prefix: list, server: dict, output_dir: str,
         "--inventory_name", name,
         "--nosession",
     ]
+
+    # Параметры соединения: только если nonzero (0 = оставить дефолт check_redfish)
+    if cr_retries:
+        cmd += ["--retries", str(int(cr_retries))]
+    if cr_timeout:
+        cmd += ["--timeout", str(int(cr_timeout))]
 
     # netbox_device_id — числовой id устройства в NetBox (meta.inventory_id),
     # если известен; netbox-sync будет матчить устройство строго по нему.
@@ -272,6 +282,14 @@ def main() -> int:
     ap.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="каталог для JSON-отчётов")
     ap.add_argument("--timeout", type=int, default=600,
                     help="таймаут опроса одного сервера, секунд (по умолчанию 600)")
+    ap.add_argument("--cr-retries", type=int,
+                    default=int(os.environ.get("CR_CONN_RETRIES", "5")),
+                    help="число ретраев redfish-клиента на запрос (-r): BMC часто "
+                         "разрывают keep-alive соединения, 5 ретраев лечит "
+                         "'max retries exhausted' (по умолчанию 5, env CR_CONN_RETRIES)")
+    ap.add_argument("--cr-timeout", type=int,
+                    default=int(os.environ.get("CR_REQ_TIMEOUT", "30")),
+                    help="таймаут одного HTTP-запроса к BMC, сек (-t, по умолчанию 30)")
     ap.add_argument("--cr-script", default=os.environ.get("CR_SCRIPT", ""),
                     help="явный путь к check_redfish.py (иначе автопоиск)")
     args = ap.parse_args()
@@ -295,7 +313,8 @@ def main() -> int:
 
     ok_count = err_count = 0
     for server in servers:
-        cmd, info = build_command(cr_prefix, server, args.output_dir, default_user, default_pass)
+        cmd, info = build_command(cr_prefix, server, args.output_dir, default_user, default_pass,
+                                  cr_retries=args.cr_retries, cr_timeout=args.cr_timeout)
         if cmd is None:
             LOG.error("Пропуск сервера: %s", info)
             err_count += 1
