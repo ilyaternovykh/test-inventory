@@ -249,6 +249,38 @@ Device: "server01" (найден по serial)
 
 ## Troubleshooting
 
+### 0. «module 'redfish' has no attribute 'redfish_client'» (traceback, rc=1)
+
+Симптом:
+```
+AttributeError: module 'redfish' has no attribute 'redfish_client'
+...
+AttributeError: module 'redfish.rest.v1' has no attribute 'RetriesExhaustedError'
+```
+
+Причина: check_redfish не фиксирует версию своей зависимости redfish-libs
+(библиотека DMTF). В **redfish >= 3.3.0** удалили legacy-API
+(`redfish.redfish_client()` и `redfish.rest.v1.RetriesExhaustedError`), на котором
+написан код check_redfish. При пересборке образа pip тянет последнюю 3.4.x —
+коллектор падает ещё до подключения к BMC (это НЕ ошибка сети/кредитов; то, что
+Prometheus-exporter работает, тут ни при чём — он использует другой API библиотеки).
+
+Решение (в образе уже сделано): Dockerfile принудительно ставит совместимую
+**redfish==3.2.0** после установки check_redfish и пинит её в метаданных пакета.
+Пересоберите:
+```bash
+git pull
+docker compose build --no-cache check_redfish-collector && docker compose up -d
+```
+Быстрая проверка/починка внутри текущего контейнера (без пересборки):
+```bash
+docker compose exec check_redfish-collector pip install "redfish==3.2.0"
+# далее перезапустить цикл: docker compose restart check_redfish-collector
+```
+Обновлённый патч теперь проверяет совместимость ДО запуска сбора и печатает
+понятную строку `[cr_login_redirect_patch] КРИТИЧЕСКОЕ НЕСОВМЕСТИМОЕ ОКРУЖЕНИЕ: ...`
+вместо трейсбека.
+
 ### 1. Нет доступа к BMC (timeout / connection refused / SSL error)
 
 Симптомы в логах коллектора: `ОШИБКА подключения (rc≠0)`,
