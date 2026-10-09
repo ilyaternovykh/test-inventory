@@ -16,6 +16,14 @@
 #                      Если задан — netbox-sync сматчит устройство строго по
 #                      нему (meta.inventory_id). Если не задан — матчинг идёт
 #                      по серийному номеру (или Dell Service Tag).
+#   api              — необязательный режим сбора. `api: ilorest` — собирать
+#                      сервер через HPE ilorest (HP REST API) вместо Redfish.
+#                      Нужен для iLO4 firmware 2.8x, где Redfish Service Root
+#                      недоступен (curl к /redfish/v1/ отдаёт HTML веб-консоли
+#                      iLO, POST Sessions отвечает 308-само-редиректом).
+#                      Ограничения MVP: собираются system/cpu/memory/nic;
+#                      PSU/диски — по запросу. Креды общие (REDFISH_*) или
+#                      per-server username/password.
 #   basic_auth       — необязательный флаг (true/false). true — собирать сервер
 #                      ЧИСТЫМ Basic-auth без создания Redfish-сессии. Нужен для
 #                      BMC, отвечающих на POST Sessions редиректом 308 с
@@ -49,3 +57,10 @@ servers:
     port: 443
     netbox_device_id: 47
     basic_auth: true
+
+  # Пример 4: HPE iLO4 firmware 2.82 — Redfish недоступен в принципе
+  # (в логах curl вместо JSON виден HTML 'iLO.getBaseUrl()', коллектор падает
+  # rc=2 даже с basic_auth). Сбор идёт через HPE ilorest (HP REST API).
+  - name: ilo4-legacy
+    host: 192.168.10.37
+    api: ilorest

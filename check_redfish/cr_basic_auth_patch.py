@@ -55,6 +55,49 @@ def _rf_err(name):
         return type(name, (Exception,), {})
 
 
+def _login_failure(conn_obj, exc):
+    """Понятная ошибка basic-auth c живой диагностикой HTTP-кодов.
+
+    Возвращает исключение (вызывающий код должен его raise). В тексте:
+      * GET /redfish/v1/ под Basic-auth — если вместо JSON приходит HTML
+        ('<html', 'iLO.getBaseUrl'), значит Redfish Service Root на iLO4 2.8x
+        ВЫКЛЮЧЕН/НЕДОСТУПЕН — лечится только апгрейдом firmware iLO или
+        режимом `api: ilorest` в servers.yaml;
+      * GET /redfish/v1/SessionService — виден статус сессионного сервиса.
+    """
+    import traceback
+    txt = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+    lines = [f"[cr_basic_auth_patch] Basic-auth логин не удался: {txt}"]
+    try:
+        import requests
+        host = getattr(getattr(conn_obj, "cli_args", None), "host", None)
+        user = getattr(conn_obj, "username", None)
+        pw = getattr(conn_obj, "password", None)
+        if host and user and pw:
+            for path in ("/redfish/v1/", "/redfish/v1/SessionService"):
+                try:
+                    r = requests.get(f"https://{host}{path}", auth=(user, pw),
+                                     timeout=15, verify=False)
+                    body = (r.text or "")[:160].replace("\n", " ")
+                    looks_html = "<html" in body.lower() or "ilo.getbaseurl" in body.lower()
+                    tag = "HTML вместо JSON — Redfish root НЕДОСТУПЕН (iLO4 2.8x)" \
+                          if looks_html else "JSON/Redfish"
+                    lines.append(f"  диагностика: GET {path} -> HTTP {r.status_code} "
+                                 f"[{tag}] {body[:100]}")
+                except Exception as de:
+                    lines.append(f"  диагностика: GET {path} -> {type(de).__name__}: {de}")
+            lines.append("  Если выше 'HTML вместо JSON': включите Redfish на iLO "
+                         "(iLO Settings > Security Access Options) или обновите "
+                         "firmware; временное решение — `api: ilorest` в servers.yaml.")
+    except Exception:
+        pass
+    try:
+        import redfish.rest.v1 as rv1
+        return rv1.RetriesExhaustedError("\n".join(lines))
+    except Exception:
+        return RuntimeError("\n".join(lines))
+
+
 def apply_patch():
     """Подменяет login_with_redirect_handling() на чистый Basic-auth. Идемпотентно."""
     try:
@@ -67,15 +110,40 @@ def apply_patch():
         return True
 
     def basic_only_login(self):
-        # Никаких POST Sessions — сразу Basic-auth через redfish-клиент.
-        self.connection.login(
-            username=self.username,
-            password=self.password,
-            session_enabled=False,
-        )
-        print("[cr_basic_auth_patch] Логин выполнен через Basic-auth "
-              "(сессии отключены: CR_FORCE_BASIC_AUTH / basic_auth: true).",
-              file=sys.stderr)
+        # Никаких POST Sessions — чистый HTTP Basic-auth.
+        # ВАЖНО: в новых версиях python-redfish у HttpClient.login параметр
+        # `session_enabled` НЕ существует (там `auth=AuthMethod.SESSION|BASIC`);
+        # старый вызов молча падал в TypeError и маскировался generic-ошибкой
+        # check_redfish. Пробуем оба варианта API, при неудаче бросаем ПОНЯТНУЮ
+        # ошибку с реальными HTTP-кодами диагностики.
+        import redfish as rf_lib
+        last_exc = None
+        try:
+            auth_basic = rf_lib.AuthMethod.BASIC
+        except Exception:
+            auth_basic = "basic"
+        for kwargs in ({"auth": auth_basic}, {"session_enabled": False}):
+            try:
+                self.connection.login(
+                    username=self.username,
+                    password=self.password,
+                    **kwargs,
+                )
+                print("[cr_basic_auth_patch] Логин выполнен через Basic-auth "
+                      "(сессии отключены: CR_FORCE_BASIC_AUTH / basic_auth: true; "
+                      f"параметр login: {next(iter(kwargs))}).",
+                      file=sys.stderr)
+                return
+            except TypeError as te:
+                # несовместимая сигнатура login() — пробуем следующий вариант
+                last_exc = te
+                continue
+            except Exception as e:
+                raise _login_failure(self, e) from e
+        # оба варианта дали TypeError — достучаться до BMC не смогли
+        raise _login_failure(self, last_exc if last_exc is not None
+                            else RuntimeError("неизвестная сигнатура login()"))
+
 
     RedfishConnection.login_with_redirect_handling = basic_only_login
     RedfishConnection._cr_basic_auth_patched = True

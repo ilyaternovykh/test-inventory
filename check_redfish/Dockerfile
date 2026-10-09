@@ -15,9 +15,13 @@ RUN apt-get update \
 
 # check_redfish ставим напрямую из GitHub (последняя версия), pyyaml — для
 # чтения списка серверов из servers.yaml
+# ilorest — HPE REST CLI: используется режимом `api: ilorest` для серверов,
+# у которых Redfish недоступен (iLO4 firmware 2.8x отдаёт HTML вместо
+# /redfish/v1/*). Ставится сразу, чтобы в рантайме не зависеть от доступа к PyPI.
 RUN pip install --upgrade pip \
     && pip install "git+https://github.com/bb-Ricardo/check_redfish" \
-    && pip install pyyaml
+    && pip install pyyaml \
+    && pip install ilorest || echo "[Dockerfile] WARNING: pip install ilorest не удался — режим api: ilorest будет ставить его автоматически при первом запуске (нужен доступ к PyPI из контейнера)"
 
 # Рабочая директория приложения
 WORKDIR /app
@@ -29,6 +33,7 @@ COPY entrypoint.sh /app/entrypoint.sh
 COPY servers_parser.py /app/servers_parser.py
 COPY cr_login_redirect_patch.py /app/cr_login_redirect_patch.py
 COPY cr_basic_auth_patch.py /app/cr_basic_auth_patch.py
+COPY cr_ilorest_patch.py /app/cr_ilorest_patch.py
 RUN chmod +x /app/entrypoint.sh
 
 # Каталог модулей PYTHONPATH для collect-а (патч подхватывается через -m)

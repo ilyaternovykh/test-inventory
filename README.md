@@ -342,6 +342,42 @@ docker compose exec check_redfish-collector curl -sk -u Administrator:ПАРОЛ
 # JSON с Members => basic-auth работает, ставьте basic_auth: true и пересоберите образ
 ```
 
+**Если basic-auth тоже не помогает (наблюдавшийся случай: iLO4 fw 2.82).** Признак:
+в ответ на `curl https://IP/redfish/v1/` вместо JSON приходит **HTML веб-консоли iLO**
+(фрагменты `iLO.getBaseUrl()`, `showLogin(...)`, `<iframe id=appFrame>`). Это значит,
+что Redfish Service Root на прошивке недоступен в принципе — любые пути `/redfish/v1/*`
+редиректятся на HTML-логин, POST Sessions отвечает 308-само-редиректом, и никакой
+Redfish-патч не поможет. Два пути:
+
+1. Правильный: обновить firmware iLO4 (Redfish стабилен с 2.50+, убедитесь, что
+   Redfish включён: *iLO Rest (Agentless Management)* / Embedded Directory Services)
+   и/или сбросить зависшие сессии (`POST /json/launch_priv_ilorest_session` не нужен —
+   достаточно перезагрузки iLO через «Reset iLO»);
+2. Рабочий без апгрейда: режим **ilorest** (HPE REST API, не зависит от Redfish Session
+   Service) — пометьте сервер в `servers.yaml`:
+
+```yaml
+servers:
+  - name: test-01
+    host: 192.168.10.37
+    api: ilorest          # сбор через HPE ilorest вместо Redfish
+    # netbox_device_id: 240  — опционально, как обычно
+```
+
+Коллектор сам установит/найдёт `ilorest` (в собранном из этого репозитория image он
+ставится на этапе build), выполнит `serverinfo/processor/memory/networkadapter` и
+запишет стандартный inventory-JSON в `/app/inventory/<name>.json` — netbox-sync не
+различает источник. Ограничения MVP режима ilorest: собираются system/CPU/DIMM/NIC
+(CPU и DIMM могут попасть в один тип компонента), PSU/диски/cooling — пока нет;
+health выставляется OK при успешном сборе. Проверка вручную из контейнера:
+
+```bash
+docker compose exec check_redfish-collector ilorest --url=192.168.10.37 \
+  --login=Administrator --password=ПАРОЛЬ --selector=OemHpProfileSet ilorest serverinfo
+# JSON c "SerialNumber"/"PowerOnDate" => ilorest работает, ждите следующий цикл или
+# перезапустите collector
+```
+
 ### 2. Устройство не найдено в NetBox / создаётся дубль
 
 - netbox-sync ищет устройство по **serial**. Убедитесь, что у существующего
