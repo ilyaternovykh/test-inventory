@@ -47,6 +47,9 @@ services:
       # отвечают 308-само-редиректом на POST Sessions и никогда не выдают токен.
       # Точечно — флаг basic_auth: true в servers.yaml по конкретному серверу.
       CR_FORCE_BASIC_AUTH: ${CR_FORCE_BASIC_AUTH:-0}
+      # Режим ilorest (для серверов api: ilorest в servers.yaml)
+      CR_ILOREST_AUTOINSTALL: ${CR_ILOREST_AUTOINSTALL:-1}
+      CR_ILOREST_TIMEOUT: ${CR_ILOREST_TIMEOUT:-120}
     volumes:
       # Общий том с JSON-файлами инвентаря (отдаётся netbox-sync)
       - inventory-data:/app/inventory

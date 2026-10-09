@@ -69,10 +69,16 @@ def _patch_wrapper(mod_name: str) -> list:
     return None
 
 
-def find_check_redfish(basic_auth: bool = False) -> list:
+def find_check_redfish(basic_auth: bool = False, api: str = "") -> list:
     """Определяем команду запуска check_redfish внутри контейнера.
 
     Приоритет:
+      0. api="ilorest" (сервер в servers.yaml помечен `api: ilorest`) —
+         сбор через HPE ilorest (HP REST API) вместо Redfish. Лечит iLO4
+         firmware 2.8x, где Redfish Service Root недоступен: любые запросы
+         к /redfish/v1/* редиректятся на HTML веб-консоли iLO (в выводе curl
+         видны 'iLO.getBaseUrl()', 'showLogin' вместо JSON), POST Sessions
+         отвечает 308-само-редиректом, basic-auth тоже бессилен.
       1. basic_auth=True (сервер в servers.yaml помечен `basic_auth: true`) —
          обёртка cr_basic_auth_patch: логин ЧИСТЫМ Basic-auth без POST Sessions.
          Лечит BMC, которые отвечают 308 Permanent Redirect с Location == тот
@@ -88,12 +94,21 @@ def find_check_redfish(basic_auth: bool = False) -> list:
       7. Модуль Python (-m check_redfish).
     Возвращает argv-префикс запуска (список).
     """
+    candidates = []
+
+    # -1) Режим ilorest (HPE REST) — полный обход нерабочего Redfish на iLO4 2.8x
+    if str(api).strip().lower() == "ilorest":
+        w = _patch_wrapper("cr_ilorest_patch")
+        if w:
+            LOG.info("Используется режим ilorest (HPE REST, обход Redfish)")
+            return w
+        LOG.warning("Запрошен api: ilorest, но cr_ilorest_patch не найден — "
+                    "падаю обратно на стандартный путь")
+
     # 0) Принудительный basic-auth по всем серверам (env) — для стендов с
     #    само-редиректящимися BMC без ручной правки servers.yaml
     if os.environ.get("CR_FORCE_BASIC_AUTH", "") == "1":
         basic_auth = True
-
-    candidates = []
 
     # 1) Обёртка Basic-auth (для проблемных BMC, см. docstring)
     if basic_auth:
@@ -224,6 +239,13 @@ def build_command(cr_prefix: list, server: dict, output_dir: str,
     if netbox_id is not None and str(netbox_id).strip() != "":
         cmd += ["--inventory_id", str(netbox_id).strip()]
 
+    # Режим ilorest: собственные креды/порт не нужны (ilorest берёт их из
+    # username/password выше), а флаги --retries/--timeout у него отсутствуют —
+    # убираем, чтобы argparse-обёртка не спотыкалась (она их игнорирует, но
+    # cleaner не передавать).
+    if str(server.get("api", "")).strip().lower() == "ilorest":
+        cmd = [a for a in cmd if a not in ("--retries", "--timeout")]
+
     return cmd, json_path
 
 
@@ -327,25 +349,26 @@ def main() -> int:
 
     force_basic = os.environ.get("CR_FORCE_BASIC_AUTH", "") == "1"
 
-    # Кэш префиксов по режиму аутентификации (basic-auth / redirect-патч)
+    # Кэш префиксов по режиму аутентификации (ilorest / basic-auth / redirect-патч)
     prefix_cache = {}
 
-    def get_prefix(basic_auth: bool) -> list:
-        key = bool(basic_auth) or force_basic
+    def get_prefix(basic_auth: bool, api: str = "") -> list:
+        key = (bool(basic_auth) or force_basic,
+               str(api).strip().lower() if not args.cr_script else "")
         if key not in prefix_cache:
             if args.cr_script:
                 # Явный путь из CLI/env важнее автопоиска
                 prefix_cache[key] = [sys.executable, args.cr_script]
                 LOG.info("check_redfish задан явно: %s", args.cr_script)
             else:
-                prefix_cache[key] = find_check_redfish(basic_auth=key)
+                prefix_cache[key] = find_check_redfish(basic_auth=key[0], api=key[1])
         return prefix_cache[key]
 
     ok_count = err_count = 0
     for server in servers:
         name = str(server.get("name", "")).strip()
         use_basic = force_basic or _as_bool(server.get("basic_auth", False))
-        cr_prefix = get_prefix(use_basic)
+        cr_prefix = get_prefix(use_basic, str(server.get("api", "")))
         cmd, info = build_command(cr_prefix, server, args.output_dir, default_user, default_pass,
                                   cr_retries=args.cr_retries, cr_timeout=args.cr_timeout)
         if cmd is None:
