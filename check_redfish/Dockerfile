@@ -22,10 +22,13 @@ RUN pip install --upgrade pip \
 # Рабочая директория приложения
 WORKDIR /app
 
-# Скрипт-обёртка, парсер списка серверов и патч совместимости логина (3xx redirect)
+# Скрипт-обёртка, парсер списка серверов и патчи совместимости логина:
+#   cr_login_redirect_patch — 3xx-редирект на POST Sessions (Unsafe redirect / 308)
+#   cr_basic_auth_patch     — чистый Basic-auth для BMC с 308-само-редиректом
 COPY entrypoint.sh /app/entrypoint.sh
 COPY servers_parser.py /app/servers_parser.py
 COPY cr_login_redirect_patch.py /app/cr_login_redirect_patch.py
+COPY cr_basic_auth_patch.py /app/cr_basic_auth_patch.py
 RUN chmod +x /app/entrypoint.sh
 
 # Каталог модулей PYTHONPATH для collect-а (патч подхватывается через -m)

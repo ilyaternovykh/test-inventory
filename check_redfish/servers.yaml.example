@@ -16,6 +16,12 @@
 #                      Если задан — netbox-sync сматчит устройство строго по
 #                      нему (meta.inventory_id). Если не задан — матчинг идёт
 #                      по серийному номеру (или Dell Service Tag).
+#   basic_auth       — необязательный флаг (true/false). true — собирать сервер
+#                      ЧИСТЫМ Basic-auth без создания Redfish-сессии. Нужен для
+#                      BMC, отвечающих на POST Sessions редиректом 308 с
+#                      Location == тот же URL (само-редирект): токен не выдаётся
+#                      никогда, коллектор падает с rc=2 'max retries exhausted'
+#                      (наблюдавалось на HPE iLO4 fw 2.82 и Lenovo XCC).
 #
 # ВНИМАНИЕ: если храните пароли здесь — файл servers.yaml содержит секреты!
 # Предпочтительнее общие credentials из .env, а в servers.yaml держать только
@@ -35,8 +41,11 @@ servers:
     # username: admin
     # password: secret
 
-  # Пример 3: Lenovo System x с XCC, отдельный id устройства в NetBox
+  # Пример 3: Lenovo System x с XCC, отдельный id устройства в NetBox.
+  # basic_auth: true — если XCC отвечает 308-само-редиректом на POST Sessions
+  # ('max retries exhausted' в логах коллектора): сбор пойдёт Basic-auth'ом.
   - name: server03
     host: 10.0.5.33
     port: 443
     netbox_device_id: 47
+    basic_auth: true
