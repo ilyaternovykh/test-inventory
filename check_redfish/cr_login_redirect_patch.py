@@ -485,9 +485,54 @@ def _network_diagnosis(host, port_hint=None):
     return "\n".join(lines)
 
 
+def check_redfish_compat():
+    """Проверка совместимости redfish-libs и check_redfish ДО запуска сбора.
+
+    Лечит ошибку вида:
+        AttributeError: module 'redfish' has no attribute 'redfish_client'
+        AttributeError: module 'redfish.rest.v1' has no attribute 'RetriesExhaustedError'
+
+    Причина: check_redfish не пинит версию зависимости redfish-libs; в redfish>=3.3.0
+    удалено legacy-API (redfish_client / rest.v1.RetriesExhaustedError), на котором
+    написан код check_redfish. Возвращает строку с описанием проблемы или None, если
+    всё в порядке.
+    """
+    try:
+        import redfish
+        import redfish.rest.v1 as rv1
+    except Exception as e:  # библиотека вообще не установлена
+        return f"Библиотека redfish не импортируется: {type(e).__name__}: {e}"
+    problems = []
+    if not hasattr(redfish, "redfish_client"):
+        problems.append("нет redfish.redfish_client")
+    if not hasattr(rv1, "RetriesExhaustedError"):
+        problems.append("нет redfish.rest.v1.RetriesExhaustedError")
+    if not problems:
+        return None
+    try:
+        from importlib.metadata import version as _v
+        ver = _v("redfish")
+    except Exception:
+        ver = "?"
+    return (f"Несовместимая версия redfish-libs {ver}: " + ", ".join(problems) +
+            ". check_redfish рассчитан на redfish<3.3.0 (legacy API). "
+            "Исправление: пересобрать образ (Dockerfile пинит redfish==3.2.0) "
+            "или вручную: pip install 'redfish==3.2.0'")
+
+
 def main():
     """Запуск check_redfish.main() с активным патчем (модуль вызывается как
     `python -m cr_login_redirect_patch ...`). Аргументы передаются как есть."""
+    # Сначала — проверка целостности окружения (ловим AttributeError про
+    # redfish_client ещё до того, как его выкинет сам check_redfish):
+    problem = check_redfish_compat()
+    if problem:
+        msg = f"[cr_login_redirect_patch] КРИТИЧЕСКОЕ НЕСОВМЕСТИМОЕ ОКРУЖЕНИЕ: {problem}"
+        print(msg, file=sys.stderr)
+        # В stock-запуске это упало бы с traceback и rc=1; здесь вывод понятен
+        # из docker logs без чтения трейсбека.
+        sys.exit(2)
+
     patched = apply_patch()
     if not patched:
         # пакет недоступен — тихо деградируем до обычного запуска

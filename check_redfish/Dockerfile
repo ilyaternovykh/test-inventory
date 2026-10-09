@@ -14,13 +14,23 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 # check_redfish ставим напрямую из GitHub (последняя версия), pyyaml — для
-# чтения списка серверов из servers.yaml
+# чтения списка серверов из servers.yaml.
+# ВАЖНО (лечит ошибку "module 'redfish' has no attribute 'redfish_client'"):
+# check_redfish НЕ пинит версию своей зависимости redfish-libs, а в redfish>=3.3.0
+# убрали legacy-API: redfish.redfish_client() и класс redfish.rest.v1.RetriesExhaustedError
+# (у check_redfish они вызываются на прямом пути кода => AttributeError => rc=1).
+# Поэтому после установки check_redfish принудительно ставим совместимую ветку
+# redfish==3.2.0 (в ней оба API присутствуют — проверено) и подменяем метаданные
+# версии, чтобы любой повторный `pip install check_redfish`/`--upgrade` в рантайме
+# НЕ перекачал redfish обратно на 3.3.x/3.4.x.
 # ilorest — HPE REST CLI: используется режимом `api: ilorest` для серверов,
 # у которых Redfish недоступен (iLO4 firmware 2.8x отдаёт HTML вместо
 # /redfish/v1/*). Ставится сразу, чтобы в рантайме не зависеть от доступа к PyPI.
 RUN pip install --upgrade pip \
     && pip install "git+https://github.com/bb-Ricardo/check_redfish" \
     && pip install pyyaml \
+    && pip install "redfish==3.2.0" \
+    && python -c "import importlib.metadata as m, glob; [open(p,'w').write(open(p).read().replace('Requires-Dist: redfish', 'Requires-Dist: redfish==3.2.0')) for p in glob.glob('/usr/local/lib/python3.9/site-packages/check_redfish-*.dist-info/METADATA')]" \
     && pip install ilorest || echo "[Dockerfile] WARNING: pip install ilorest не удался — режим api: ilorest будет ставить его автоматически при первом запуске (нужен доступ к PyPI из контейнера)"
 
 # Рабочая директория приложения
