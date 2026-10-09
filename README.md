@@ -314,6 +314,34 @@ docker compose exec check_redfish-collector curl -sk -i -X POST \
 увеличьте ретраи/таймауты в `.env`: `CR_CONN_RETRIES=8`, `CR_REQ_TIMEOUT=60`.
 Отключить патч целиком: `CR_FIX_REDIRECT=0` (не рекомендуется для XCC).
 
+**Крайний случай: 308-само-редирект, токен не выдаётся никогда.** Если в логах видно
+`POST .../Sessions -> HTTP 308, Location: .../Sessions` (Location == тот же URL) и
+collect падает с rc=2 даже с redirect-патчем — прошивка BMC заворачивает ЛЮБОЙ POST
+на Sessions в себя, и сессионный логин невозможен в принципе. Наблюдались два класса
+таких устройств: **HPE iLO4 (fw 2.82)** и **Lenovo XCC** — у iLO4 это типично при
+выключенном/переполненном Redfish Session Service или после серии неудачных входов.
+В этом случае включите режим чистого Basic-auth (без POST Sessions вообще):
+
+```yaml
+# servers.yaml — точечно по проблемному серверу (пример: iLO4 2.82):
+servers:
+  - name: test-01
+    host: 192.168.10.37
+    basic_auth: true      # сбор через Authorization: Basic, сессии не создаются
+```
+
+или глобально для всех серверов — `CR_FORCE_BASIC_AUTH=1` в `.env`. Реализация —
+модуль `cr_basic_auth_patch.py`; GET-запросы к `/redfish/v1/*` под Basic-auth на
+таких BMC работают штатно. При падении basic-auth коллектор дополнительно печатает
+DNS/TCP-диагностику хоста. Быстрая проверка «жив ли» Basic-auth на вашем BMC из
+контейнера collector:
+
+```bash
+docker compose exec check_redfish-collector curl -sk -u Administrator:ПАРОЛЬ \
+  https://192.168.10.37/redfish/v1/Systems | head -c 200
+# JSON с Members => basic-auth работает, ставьте basic_auth: true и пересоберите образ
+```
+
 ### 2. Устройство не найдено в NetBox / создаётся дубль
 
 - netbox-sync ищет устройство по **serial**. Убедитесь, что у существующего

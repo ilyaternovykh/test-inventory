@@ -53,49 +53,64 @@ DEFAULT_OUTPUT_DIR = "/app/inventory"
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
-def find_check_redfish() -> list:
+def _patch_wrapper(mod_name: str) -> list:
+    """Возвращает argv-префикс `python -m <mod_name>`, если модуль доступен
+    (PYTHONPATH=/app или файл рядом с этим скриптом). Иначе None."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec(mod_name) is not None:
+            return [sys.executable, "-m", mod_name]
+    except (ImportError, ValueError, ModuleNotFoundError):
+        pass
+    local_mod = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             mod_name + ".py")
+    if os.path.exists(local_mod):
+        return [sys.executable, local_mod]
+    return None
+
+
+def find_check_redfish(basic_auth: bool = False) -> list:
     """Определяем команду запуска check_redfish внутри контейнера.
 
     Приоритет:
-      1. Патч-обёртка cr_login_redirect_patch (env CR_FIX_REDIRECT != "0"):
-         запускается как модуль `python -m cr_login_redirect_patch` — она
-         чинит падение «Unsafe redirect location» на BMC, отвечающих 3xx
-         редиректом на POST Sessions (XCC/Supermicro/часть iDRAC/iLO), и
-         затем передаёт управление штатному check_redfish.main().
-      2. env CR_SCRIPT / аргумент --cr-script (явный путь, для отладки).
-      3. pip-installed раскладка (скрипт рядом с интерпретатором).
-      4. git clone в типовые каталоги (/opt/check_redfish и т.п.).
-      5. check_redfish(.py) в PATH.
-      6. Модуль Python (-m check_redfish).
+      1. basic_auth=True (сервер в servers.yaml помечен `basic_auth: true`) —
+         обёртка cr_basic_auth_patch: логин ЧИСТЫМ Basic-auth без POST Sessions.
+         Лечит BMC, которые отвечают 308 Permanent Redirect с Location == тот
+         же URL (само-редирект): сессионный токен на них не выдаётся никогда,
+         любой redirect-патч бессилен (симптом: rc=2 'max retries exhausted').
+      2. Патч-обёртка cr_login_redirect_patch (env CR_FIX_REDIRECT != "0"):
+         резолвит относительный Location и повторяет POST при 3xx на
+         POST Sessions (XCC/Supermicro/часть iDRAC/iLO), затем штатный main().
+      3. env CR_SCRIPT / аргумент --cr-script (явный путь, для отладки).
+      4. pip-installed раскладка (скрипт рядом с интерпретатором).
+      5. git clone в типовые каталоги (/opt/check_redfish и т.п.).
+      6. check_redfish(.py) в PATH.
+      7. Модуль Python (-m check_redfish).
     Возвращает argv-префикс запуска (список).
     """
+    # 0) Принудительный basic-auth по всем серверам (env) — для стендов с
+    #    само-редиректящимися BMC без ручной правки servers.yaml
+    if os.environ.get("CR_FORCE_BASIC_AUTH", "") == "1":
+        basic_auth = True
+
     candidates = []
 
-    # 0) Патч-модуль совместимости 3xx-редиректа (по умолчанию включён)
+    # 1) Обёртка Basic-auth (для проблемных BMC, см. docstring)
+    if basic_auth:
+        w = _patch_wrapper("cr_basic_auth_patch")
+        if w:
+            LOG.info("Используется Basic-auth режим (cr_basic_auth_patch)")
+            return w
+        LOG.warning("Запрошен basic_auth, но cr_basic_auth_patch не найден — "
+                    "падаю обратно на redirect-патч")
+
+    # 2) Патч-модуль совместимости 3xx-редиректа (по умолчанию включён)
     if os.environ.get("CR_FIX_REDIRECT", "1") != "0":
-        try:
-            import importlib.util
-            if importlib.util.find_spec("cr_login_redirect_patch") is not None:
-                return [sys.executable, "-m", "cr_login_redirect_patch"]
-        except (ImportError, ValueError, ModuleNotFoundError):
-            pass
-        # fallback: файл рядом с этим скриптом (если PYTHONPATH=/app не задан)
-        local_mod = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                 "cr_login_redirect_patch.py")
-        if os.path.exists(local_mod):
-            return [sys.executable, local_mod]
+        w = _patch_wrapper("cr_login_redirect_patch")
+        if w:
+            return w
 
-    # 1) Вариант "pip install git+https://..." — скрипт рядом с интерпретатором
-    bin_dir = os.path.dirname(sys.executable)
-    for name in ("check_redfish.py", "check_redfish"):
-        path = os.path.join(bin_dir, name)
-        if os.path.exists(path):
-            candidates.append([sys.executable, path])
-
-    # 0) Явное указание (env/CLI) — имеет приоритет
-    # (обрабатывается в main через args.cr_script)
-
-    # 1) Вариант "pip install git+https://..." — скрипт рядом с интерпретатором
+    # 3) Вариант "pip install git+https://..." — скрипт рядом с интерпретатором
     bin_dir = os.path.dirname(sys.executable)
     for name in ("check_redfish.py", "check_redfish"):
         path = os.path.join(bin_dir, name)
@@ -304,22 +319,39 @@ def main() -> int:
         return 2
     LOG.info("Загружено серверов: %d (конфиг: %s)", len(servers), args.config)
 
-    # Явный путь из CLI/env важнее автопоиска
-    if args.cr_script:
-        cr_prefix = [sys.executable, args.cr_script]
-        LOG.info("check_redfish задан явно: %s", args.cr_script)
-    else:
-        cr_prefix = find_check_redfish()
+    def _as_bool(v):
+        """Нормализация YAML-флага basic_auth (true/'true'/1/'yes')."""
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    force_basic = os.environ.get("CR_FORCE_BASIC_AUTH", "") == "1"
+
+    # Кэш префиксов по режиму аутентификации (basic-auth / redirect-патч)
+    prefix_cache = {}
+
+    def get_prefix(basic_auth: bool) -> list:
+        key = bool(basic_auth) or force_basic
+        if key not in prefix_cache:
+            if args.cr_script:
+                # Явный путь из CLI/env важнее автопоиска
+                prefix_cache[key] = [sys.executable, args.cr_script]
+                LOG.info("check_redfish задан явно: %s", args.cr_script)
+            else:
+                prefix_cache[key] = find_check_redfish(basic_auth=key)
+        return prefix_cache[key]
 
     ok_count = err_count = 0
     for server in servers:
+        name = str(server.get("name", "")).strip()
+        use_basic = force_basic or _as_bool(server.get("basic_auth", False))
+        cr_prefix = get_prefix(use_basic)
         cmd, info = build_command(cr_prefix, server, args.output_dir, default_user, default_pass,
                                   cr_retries=args.cr_retries, cr_timeout=args.cr_timeout)
         if cmd is None:
             LOG.error("Пропуск сервера: %s", info)
             err_count += 1
             continue
-        name = str(server.get("name")).strip()
         json_path = info  # при успешной сборке команды info — путь к JSON
         success = run_server(cmd, name, args.timeout)
         if success and not validate_json(json_path, name):

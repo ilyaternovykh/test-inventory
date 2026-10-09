@@ -43,6 +43,10 @@ services:
       # Максимум шагов обхода 3xx-редиректов для GET-запросов к BMC
       # (патч автообхода; актуально для Lenovo XCC с '308 Moved Permanently')
       CR_MAX_REDIRECTS: ${CR_MAX_REDIRECTS:-5}
+      # Принудительный Basic-auth для всех серверов (1 = вкл): для BMC, которые
+      # отвечают 308-само-редиректом на POST Sessions и никогда не выдают токен.
+      # Точечно — флаг basic_auth: true в servers.yaml по конкретному серверу.
+      CR_FORCE_BASIC_AUTH: ${CR_FORCE_BASIC_AUTH:-0}
     volumes:
       # Общий том с JSON-файлами инвентаря (отдаётся netbox-sync)
       - inventory-data:/app/inventory
